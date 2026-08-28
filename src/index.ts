@@ -15,6 +15,7 @@ import { splitAndFilterMarkdown } from './message.js'
 import { MessageQueue } from './queue.js'
 import { handleRemoteCommand, type RemoteCommandDeps } from './remote-commands.js'
 import { registerCommands, type CommandDeps } from './commands.js'
+import { AskBridge, formatQuestion, type AskQuestion } from './ask-bridge.js'
 import { ok, fail, formatError, isAbortError, extractAllAssistantReplies, extractTextFromMessageContent } from './utils.js'
 import {
   POLL_RETRY_BASE_MS,
@@ -123,6 +124,12 @@ export default function wechatAssistant(pi: ExtensionAPI) {
   const turn = new TurnContext()
   let lockSessionId: string | null = null
 
+  // --- AskUserQuestion 接管 ---
+  const askBridge = new AskBridge()
+  // rpiv:ask-user:prompt 在弹框前到达；custom() 包装器凭它判断「这个弹框是问卷」
+  let askTakeover: { questions: AskQuestion[]; at: number } | null = null
+  let askWrapperInstalled = false
+
   // --- 消息队列 ---
   const queue = new MessageQueue(
     () => client,
@@ -202,6 +209,7 @@ export default function wechatAssistant(pi: ExtensionAPI) {
 
   async function stopBridge(options: { releaseLock?: boolean } = {}): Promise<void> {
     running = false
+    askBridge.cancelAll()
     pollAbort?.abort()
     pollAbort = null
 
@@ -213,6 +221,34 @@ export default function wechatAssistant(pi: ExtensionAPI) {
     turn.reset()
     if (options.releaseLock) await unlock()
     updateStatusBar()
+  }
+
+  // --- AskUserQuestion 接管：桥接激活的微信轮次里，问卷不弹 TUI，改走微信问答 ---
+
+  function installAskTakeover(ctx: Ctx): void {
+    if (askWrapperInstalled || !ctx.hasUI) return
+    const ui = ctx.ui as unknown as { custom?: (...args: unknown[]) => Promise<unknown> }
+    const original = ui.custom?.bind(ctx.ui)
+    if (!original) return
+    askWrapperInstalled = true
+    ui.custom = (...args: unknown[]) => {
+      const takeover = askTakeover
+      askTakeover = null
+      // ponytail: prompt 事件与弹框间只隔一次模块懒加载，10s 时效窗防误接管其他扩展的 overlay
+      const fresh = takeover !== null && Date.now() - takeover.at < 10_000
+      const target = turn.targetUser ?? queue.lastWechatUser?.userId ?? null
+      if (fresh && running && client && turn.wechatConversationActive && target) {
+        const activeClient = client
+        const questions = takeover!.questions
+        log(`[ASK-TAKEOVER] ${questions.length} questions -> ${target}`)
+        notify(
+          [`AskUserQuestion 已转微信（${questions.length} 题），等待微信作答…`, '', ...questions.map((q, i) => formatQuestion(q, i, questions.length))].join('\n'),
+          'info',
+        )
+        return askBridge.run(questions, target, (u, t) => activeClient.sendText(u, t))
+      }
+      return original(...args)
+    }
   }
 
   // --- 系统提示词 ---
@@ -272,6 +308,12 @@ export default function wechatAssistant(pi: ExtensionAPI) {
       activeClient.rememberContext(message.raw)
       const handled = await handleRemoteCommand(message.text, message.userId, activeClient, remoteCommandDeps)
       if (handled) return
+    }
+
+    // 有进行中的 AskUserQuestion 问卷时，文本消息优先当答案消费，不入队
+    if (askBridge.active && !message.text.startsWith('/')) {
+      activeClient.rememberContext(message.raw)
+      if (askBridge.handleReply(message.userId, message.text)) return
     }
 
     queue.enqueue(message)
@@ -381,9 +423,17 @@ export default function wechatAssistant(pi: ExtensionAPI) {
   // 事件处理
   // ============================================================================
 
+  // ask-user-question 扩展在弹框前广播的公开事件（频道名承诺不可变，写字面量避免硬依赖）
+  pi.events.on('rpiv:ask-user:prompt', (payload: unknown) => {
+    const questions = (payload as { questions?: AskQuestion[] } | undefined)?.questions
+    if (!questions?.length) return
+    askTakeover = { questions, at: Date.now() }
+  })
+
   pi.on('session_start', async (_event, ctx) => {
     latestCtx = ctx
     wechatFilesDir = path.join(ctx.cwd, WECHAT_FILES_SUBDIR)
+    installAskTakeover(ctx)
     await loadClient()
     updateStatusBar()
 
@@ -485,6 +535,11 @@ export default function wechatAssistant(pi: ExtensionAPI) {
     latestCtx = ctx
     agentIdle = true
     turn.ended = true
+    // 正常流程问卷 resolve 后 agent 才会结束；这里只兜异常残留（如中途 abort）
+    if (askBridge.active) {
+      log(`[ASK-CLEANUP] cancelling stale questionnaire`)
+      askBridge.cancelAll()
+    }
     turn.messages = event.messages as Array<{ role?: string; content?: unknown }>
 
     const msgCount = turn.messages.length
